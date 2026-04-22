@@ -132,9 +132,31 @@ class AnalysisAgent:
                     messages=[{"role": "user", "content": prompt}],
                     **kwargs,
                 )
-                content = resp.choices[0].message.content
-                if content is None:
-                    raise ValueError("LLM returned empty content")
+                message = resp.choices[0].message
+                content = message.content
+
+                if isinstance(content, list):
+                    text_parts = []
+                    for part in content:
+                        if isinstance(part, dict):
+                            text = part.get("text")
+                            if text:
+                                text_parts.append(text)
+                        else:
+                            text = getattr(part, "text", None)
+                            if text:
+                                text_parts.append(text)
+                    content = "\n".join(text_parts).strip()
+
+                if not content:
+                    reasoning_content = getattr(message, "reasoning_content", None)
+                    if isinstance(reasoning_content, str) and reasoning_content.strip():
+                        content = reasoning_content.strip()
+
+                if not isinstance(content, str) or not content.strip():
+                    logger.warning(f"LLM返回空内容，尝试降级参数（第{idx}次）")
+                    continue
+
                 return content, resp.usage
             except BadRequestError as e:
                 last_bad_request = e
@@ -144,8 +166,11 @@ class AnalysisAgent:
                 continue
 
         if last_bad_request is not None:
-            raise last_bad_request
-        raise ValueError("LLM call failed without a recoverable response")
+            logger.warning("LLM调用在所有兼容参数下仍失败，使用降级默认结果")
+
+        if expect_json:
+            return "{}", None
+        return "", None
 
     def _call_cheap_llm(self, prompt: str) -> str:
         """调用低成本LLM（JSON模式），带自动重试。"""
@@ -465,9 +490,6 @@ class AnalysisAgent:
 
         except Exception as e:
             logger.error(f"论文评分失败: {e}")
-            import traceback
-
-            traceback.print_exc()
 
             # 返回默认低分
             return WeightedScoreResponse(
@@ -631,9 +653,6 @@ class AnalysisAgent:
 
         except Exception as e:
             logger.error(f"深度分析失败: {e}")
-            import traceback
-
-            traceback.print_exc()
             return None
 
     def _download_and_parse_pdf(self, pdf_url: str) -> Optional[str]:
