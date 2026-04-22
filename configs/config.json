@@ -3,8 +3,8 @@
   // Search Configuration
   // ==================================================
   "search_settings": {
-    "search_days": 14,
-    "max_results": 100,
+    "search_days": 5,
+    "max_results": 300,
     "max_results_per_source": {}
   },
 
@@ -13,7 +13,10 @@
   // ==================================================
   "data_sources": {
     "enabled": [
-      "arxiv"
+      "arxiv",
+      "prx",
+      "nature_communications",
+      "science_advances"
     ],
     "journals": [],
     "reports_by_source": true,
@@ -34,7 +37,10 @@
   // ==================================================
   "target_domains": {
     "domains": [
-      "quant-ph"
+      "cs",
+      "econ",
+      "q-fin",
+      "stat"
     ]
   },
 
@@ -44,7 +50,64 @@
   "keywords": {
     "primary_keywords": {
       "weight": 1.0,
-      "keywords": []
+      "keywords": [
+        "futures trading",
+        "options pricing",
+        "volatility trading",
+        "derivatives strategies",
+        "market microstructure",
+        "greeks",
+        "implied volatility",
+        "term structure",
+        "options market making",
+        "intraday trading",
+        "high-frequency trading (HFT)",
+        "order book",
+        "limit order book",
+        "tick data",
+        "transaction costs",
+        "slippage",
+        "latency",
+        "technical indicators",
+        "moving average crossover",
+        "relative strength index (RSI)",
+        "Bollinger Bands",
+        "candlestick patterns",
+        "support resistance",
+        "momentum trading",
+        "trend following",
+        "statistical arbitrage",
+        "machine learning trading",
+        "LSTM financial prediction",
+        "reinforcement learning trading",
+        "feature engineering financial data",
+        "ensemble methods finance",
+        "neural networks market prediction",
+        "backtesting machine learning",
+        "overfitting financial models",
+        "backtesting",
+        "execution algorithms",
+        "transaction cost analysis (TCA)",
+        "position sizing",
+        "risk management trading",
+        "live trading",
+        "strategy deployment",
+        "performance attribution",
+        "asset allocation",
+        "portfolio optimization",
+        "risk parity",
+        "multi-asset strategies",
+        "tactical asset allocation",
+        "global macro",
+        "cross-asset correlation",
+        "pairs trading",
+        "index arbitrage",
+        "basis trading",
+        "convergence trading",
+        "carry trade",
+        "volatility arbitrage",
+        "merger arbitrage"
+      ]
     },
     "enable_reference_extraction": true,
     "reference_keywords_config": {
@@ -65,7 +128,7 @@
         }
       }
     },
-    "research_context": ""
+    "research_context": "quant trading"
   },
 
   // ==================================================
@@ -76,7 +139,7 @@
       "max_score_per_keyword": 10
     },
     "author_bonus": {
-      "enabled": false,
+      "enabled": true,
       "expert_authors": [],
       "bonus_points": 5.0
     },
@@ -84,7 +147,7 @@
       "base_score": 1.5,
       "weight_coefficient": 2.5
     },
-    "include_all_in_report": true
+    "include_all_in_report": false
   },
 
   // ==================================================
@@ -135,10 +198,10 @@
     "on_success": true,
     "on_failure": true,
     "attach_reports": true,
-    "top_n": 5,
+    "top_n": 10,
     "channels": {
       "email": {
-        "enabled": false
+        "enabled": true
       },
       "wechat_work": {
         "enabled": true

@@ -6,7 +6,7 @@ import requests
 import fitz  # pymupdf
 from typing import Optional, Dict, Any, List
 from pathlib import Path
-from openai import OpenAI
+from openai import OpenAI, BadRequestError
 from pydantic import BaseModel, ValidationError
 from tenacity import retry, stop_after_attempt, wait_exponential, before_sleep_log
 
@@ -98,6 +98,55 @@ class AnalysisAgent:
     # 带重试的 LLM / HTTP 调用封装
     # ======================================================================
 
+    def _chat_completion_with_fallback(
+        self,
+        client: OpenAI,
+        model: str,
+        prompt: str,
+        temperature: Optional[float] = None,
+        expect_json: bool = False,
+    ):
+        """
+        调用 chat.completions，自动兼容不同网关/模型参数差异。
+
+        降级顺序：
+        1) temperature + response_format(json_object)（仅 expect_json=True）
+        2) temperature
+        3) 不带 temperature
+        """
+        attempt_kwargs = []
+        if expect_json:
+            attempt_kwargs.append(
+                {"temperature": temperature, "response_format": {"type": "json_object"}}
+            )
+        if temperature is not None:
+            attempt_kwargs.append({"temperature": temperature})
+        attempt_kwargs.append({})
+
+        last_bad_request = None
+
+        for idx, kwargs in enumerate(attempt_kwargs, 1):
+            try:
+                resp = client.chat.completions.create(
+                    model=model,
+                    messages=[{"role": "user", "content": prompt}],
+                    **kwargs,
+                )
+                content = resp.choices[0].message.content
+                if content is None:
+                    raise ValueError("LLM returned empty content")
+                return content, resp.usage
+            except BadRequestError as e:
+                last_bad_request = e
+                logger.warning(
+                    f"LLM参数兼容降级: 第{idx}次调用失败，将尝试更兼容参数。错误: {str(e)[:180]}"
+                )
+                continue
+
+        if last_bad_request is not None:
+            raise last_bad_request
+        raise ValueError("LLM call failed without a recoverable response")
+
     def _call_cheap_llm(self, prompt: str) -> str:
         """调用低成本LLM（JSON模式），带自动重试。"""
         estimated_prompt_tokens = len(prompt) // 4
@@ -110,11 +159,12 @@ class AnalysisAgent:
         )
         def _do_call():
             try:
-                resp = self.cheap_client.chat.completions.create(
+                content, usage = self._chat_completion_with_fallback(
+                    client=self.cheap_client,
                     model=settings.CHEAP_LLM.model_name,
-                    messages=[{"role": "user", "content": prompt}],
+                    prompt=prompt,
                     temperature=settings.CHEAP_LLM.temperature,
-                    response_format={"type": "json_object"},
+                    expect_json=True,
                 )
             except Exception:
                 if settings.TOKEN_TRACKING_ENABLED:
@@ -122,15 +172,15 @@ class AnalysisAgent:
 
                     token_counter.add(settings.CHEAP_LLM.model_name, estimated_prompt_tokens, 0)
                 raise
-            if settings.TOKEN_TRACKING_ENABLED and resp.usage:
+            if settings.TOKEN_TRACKING_ENABLED and usage:
                 from utils.token_counter import token_counter
 
                 token_counter.add(
                     settings.CHEAP_LLM.model_name,
-                    resp.usage.prompt_tokens,
-                    resp.usage.completion_tokens,
+                    usage.prompt_tokens,
+                    usage.completion_tokens,
                 )
-            return resp.choices[0].message.content
+            return content
 
         return _do_call()
 
@@ -146,10 +196,12 @@ class AnalysisAgent:
         )
         def _do_call():
             try:
-                resp = self.cheap_client.chat.completions.create(
+                content, usage = self._chat_completion_with_fallback(
+                    client=self.cheap_client,
                     model=settings.CHEAP_LLM.model_name,
-                    messages=[{"role": "user", "content": prompt}],
+                    prompt=prompt,
                     temperature=0.3,
+                    expect_json=False,
                 )
             except Exception:
                 if settings.TOKEN_TRACKING_ENABLED:
@@ -157,15 +209,15 @@ class AnalysisAgent:
 
                     token_counter.add(settings.CHEAP_LLM.model_name, estimated_prompt_tokens, 0)
                 raise
-            if settings.TOKEN_TRACKING_ENABLED and resp.usage:
+            if settings.TOKEN_TRACKING_ENABLED and usage:
                 from utils.token_counter import token_counter
 
                 token_counter.add(
                     settings.CHEAP_LLM.model_name,
-                    resp.usage.prompt_tokens,
-                    resp.usage.completion_tokens,
+                    usage.prompt_tokens,
+                    usage.completion_tokens,
                 )
-            return resp.choices[0].message.content.strip()
+            return content.strip()
 
         return _do_call()
 
@@ -181,11 +233,12 @@ class AnalysisAgent:
         )
         def _do_call():
             try:
-                resp = self.smart_client.chat.completions.create(
+                content, usage = self._chat_completion_with_fallback(
+                    client=self.smart_client,
                     model=settings.SMART_LLM.model_name,
-                    messages=[{"role": "user", "content": prompt}],
+                    prompt=prompt,
                     temperature=settings.SMART_LLM.temperature,
-                    response_format={"type": "json_object"},
+                    expect_json=True,
                 )
             except Exception:
                 if settings.TOKEN_TRACKING_ENABLED:
@@ -193,15 +246,15 @@ class AnalysisAgent:
 
                     token_counter.add(settings.SMART_LLM.model_name, estimated_prompt_tokens, 0)
                 raise
-            if settings.TOKEN_TRACKING_ENABLED and resp.usage:
+            if settings.TOKEN_TRACKING_ENABLED and usage:
                 from utils.token_counter import token_counter
 
                 token_counter.add(
                     settings.SMART_LLM.model_name,
-                    resp.usage.prompt_tokens,
-                    resp.usage.completion_tokens,
+                    usage.prompt_tokens,
+                    usage.completion_tokens,
                 )
-            return resp.choices[0].message.content
+            return content
 
         return _do_call()
 
@@ -224,9 +277,14 @@ class AnalysisAgent:
 
         return _do_download()
 
-    def _clean_json_string(self, json_str: str) -> str:
+    def _clean_json_string(self, json_str: Optional[str]) -> str:
         """清理LLM响应中的Markdown代码块标记和非法转义字符。"""
         # 移除Markdown代码块标记
+        if json_str is None:
+            return ""
+        if not isinstance(json_str, str):
+            json_str = str(json_str)
+
         if "```json" in json_str:
             json_str = json_str.split("```json")[1].split("```")[0]
         elif "```" in json_str:

@@ -21,6 +21,22 @@ from utils.run_lock import run_lock
 logger = setup_logger("Main")
 
 
+def _ensure_utf8_console_on_windows():
+    """
+    Ensure UTF-8 console output on Windows to avoid UnicodeEncodeError
+    when printing emoji/non-GBK characters.
+    """
+    if sys.platform != "win32":
+        return
+    try:
+        if hasattr(sys.stdout, "reconfigure"):
+            sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        if hasattr(sys.stderr, "reconfigure"):
+            sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
+
 def parse_args():
     """解析命令行参数"""
     parser = argparse.ArgumentParser(
@@ -80,6 +96,7 @@ def parse_args():
 
 
 if __name__ == "__main__":
+    _ensure_utf8_console_on_windows()
     settings.ensure_directories()
 
     # 自动更新检查

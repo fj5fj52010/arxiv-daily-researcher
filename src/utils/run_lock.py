@@ -8,7 +8,6 @@
   trend_research_<params_hash>.lock  — 趋势研究（相同参数同时只允许一个）
 """
 
-import fcntl
 import hashlib
 import os
 import re
@@ -19,6 +18,47 @@ from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import List, Optional
+
+try:
+    import fcntl
+
+    _USE_FCNTL = True
+except ModuleNotFoundError:
+    fcntl = None
+    _USE_FCNTL = False
+    try:
+        import portalocker
+
+        _WIN_LOCK_BACKEND = "portalocker"
+    except ModuleNotFoundError:
+        portalocker = None
+        import msvcrt
+
+        _WIN_LOCK_BACKEND = "msvcrt"
+
+
+def _lock_ex_nb(lock_file) -> None:
+    """Acquire exclusive non-blocking lock in a cross-platform way."""
+    if _USE_FCNTL:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    elif _WIN_LOCK_BACKEND == "portalocker":
+        portalocker.lock(lock_file, portalocker.LOCK_EX | portalocker.LOCK_NB)
+    else:
+        # Windows fallback without extra dependency (lock first byte).
+        # Use non-blocking lock to preserve existing behavior.
+        lock_file.seek(0)
+        msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+
+
+def _unlock(lock_file) -> None:
+    """Release lock in a cross-platform way."""
+    if _USE_FCNTL:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+    elif _WIN_LOCK_BACKEND == "portalocker":
+        portalocker.unlock(lock_file)
+    else:
+        lock_file.seek(0)
+        msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
 
 
 def _lock_dir() -> Path:
@@ -194,14 +234,14 @@ def run_lock(
     lock_file = open(lock_path, "a+")
 
     try:
-        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        _lock_ex_nb(lock_file)
     except (IOError, OSError):
         # 若锁已超龄，尝试回收并重试一次获取锁
         recovered = _recover_expired_lock(lock_file, task_desc, max_age_hours)
         acquired_after_recovery = False
         if recovered:
             try:
-                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                _lock_ex_nb(lock_file)
             except (IOError, OSError):
                 pass
             else:
@@ -254,7 +294,7 @@ def run_lock(
     finally:
         signal.signal(signal.SIGTERM, _old_sigterm)
         try:
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+            _unlock(lock_file)
             lock_file.close()
             lock_path.unlink(missing_ok=True)
         except Exception:
