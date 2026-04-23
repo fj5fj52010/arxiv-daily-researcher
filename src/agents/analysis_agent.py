@@ -98,6 +98,101 @@ class AnalysisAgent:
     # 带重试的 LLM / HTTP 调用封装
     # ======================================================================
 
+    def _extract_text_from_chat_message(self, message) -> Optional[str]:
+        """从 chat.completions message 中提取可用文本。"""
+        if message is None:
+            return None
+
+        content = getattr(message, "content", None)
+        if isinstance(content, str) and content.strip():
+            return content.strip()
+
+        if isinstance(content, list):
+            text_parts = []
+            for part in content:
+                text = None
+                if isinstance(part, dict):
+                    text = part.get("text")
+                else:
+                    text = getattr(part, "text", None)
+                if isinstance(text, str) and text.strip():
+                    text_parts.append(text.strip())
+            if text_parts:
+                return "\n".join(text_parts).strip()
+
+        reasoning_content = getattr(message, "reasoning_content", None)
+        if isinstance(reasoning_content, str) and reasoning_content.strip():
+            return reasoning_content.strip()
+
+        return None
+
+    def _extract_text_from_responses_payload(self, response_obj) -> Optional[str]:
+        """从 responses API 返回结构中提取可用文本。"""
+        if response_obj is None:
+            return None
+
+        output_text = getattr(response_obj, "output_text", None)
+        if isinstance(output_text, str) and output_text.strip():
+            return output_text.strip()
+
+        output = getattr(response_obj, "output", None)
+        if not isinstance(output, list):
+            return None
+
+        text_parts = []
+        for item in output:
+            if isinstance(item, dict):
+                content_list = item.get("content")
+            else:
+                content_list = getattr(item, "content", None)
+            if not isinstance(content_list, list):
+                continue
+
+            for chunk in content_list:
+                if isinstance(chunk, dict):
+                    text = chunk.get("text")
+                else:
+                    text = getattr(chunk, "text", None)
+                if isinstance(text, str) and text.strip():
+                    text_parts.append(text.strip())
+
+        if text_parts:
+            return "\n".join(text_parts).strip()
+
+        return None
+
+    def _extract_usage_tokens(self, usage):
+        """兼容 chat.completions / responses 的 usage 字段。"""
+        if usage is None:
+            return None
+
+        prompt_tokens = getattr(usage, "prompt_tokens", None)
+        completion_tokens = getattr(usage, "completion_tokens", None)
+
+        if prompt_tokens is None:
+            prompt_tokens = getattr(usage, "input_tokens", None)
+        if completion_tokens is None:
+            completion_tokens = getattr(usage, "output_tokens", None)
+
+        if prompt_tokens is None or completion_tokens is None:
+            return None
+        return int(prompt_tokens), int(completion_tokens)
+
+    def _record_token_usage(self, model_name: str, estimated_prompt_tokens: int, usage) -> None:
+        """统一记录 token 消耗。"""
+        if not settings.TOKEN_TRACKING_ENABLED:
+            return
+
+        from utils.token_counter import token_counter
+
+        token_pair = self._extract_usage_tokens(usage)
+        if token_pair is None:
+            token_counter.add(model_name, estimated_prompt_tokens, 0)
+            return
+
+        prompt_tokens, completion_tokens = token_pair
+        token_counter.add(model_name, prompt_tokens, completion_tokens)
+
     def _chat_completion_with_fallback(
         self,
         client: OpenAI,
@@ -172,6 +267,74 @@ class AnalysisAgent:
             return "{}", None
         return "", None
 
+    def _llm_call_with_fallback(
+        self,
+        client: OpenAI,
+        model: str,
+        prompt: str,
+        temperature: Optional[float] = None,
+        expect_json: bool = False,
+    ):
+        """优先 chat.completions，失败或空内容时回退 responses API。"""
+        attempt_kwargs = []
+        if expect_json:
+            attempt_kwargs.append(
+                {"temperature": temperature, "response_format": {"type": "json_object"}}
+            )
+        if temperature is not None:
+            attempt_kwargs.append({"temperature": temperature})
+        attempt_kwargs.append({})
+
+        last_error = None
+
+        for idx, kwargs in enumerate(attempt_kwargs, 1):
+            try:
+                resp = client.chat.completions.create(
+                    model=model,
+                    messages=[{"role": "user", "content": prompt}],
+                    **kwargs,
+                )
+                content = self._extract_text_from_chat_message(resp.choices[0].message)
+                if not content:
+                    logger.warning(f"chat.completions 返回空内容，尝试降级参数（第{idx}次）")
+                    continue
+                return content, getattr(resp, "usage", None)
+            except Exception as e:
+                last_error = e
+                logger.warning(
+                    f"chat.completions 调用失败（第{idx}次）: {type(e).__name__}: {str(e)[:180]}"
+                )
+
+        if hasattr(client, "responses"):
+            for idx, kwargs in enumerate(attempt_kwargs, 1):
+                responses_kwargs = dict(kwargs)
+                responses_kwargs.pop("response_format", None)
+                try:
+                    resp = client.responses.create(
+                        model=model,
+                        input=prompt,
+                        **responses_kwargs,
+                    )
+                    content = self._extract_text_from_responses_payload(resp)
+                    if not content:
+                        logger.warning(f"responses API 返回空内容，尝试降级参数（第{idx}次）")
+                        continue
+                    return content, getattr(resp, "usage", None)
+                except Exception as e:
+                    last_error = e
+                    logger.warning(
+                        f"responses API 调用失败（第{idx}次）: {type(e).__name__}: {str(e)[:180]}"
+                    )
+        else:
+            logger.warning("当前 OpenAI SDK 不支持 responses API，跳过 responses 回退")
+
+        if last_error is not None:
+            logger.warning(f"LLM 调用最终失败，使用降级默认结果: {type(last_error).__name__}")
+
+        if expect_json:
+            return "{}", None
+        return "", None
+
     def _call_cheap_llm(self, prompt: str) -> str:
         """调用低成本LLM（JSON模式），带自动重试。"""
         estimated_prompt_tokens = len(prompt) // 4
@@ -184,7 +347,7 @@ class AnalysisAgent:
         )
         def _do_call():
             try:
-                content, usage = self._chat_completion_with_fallback(
+                content, usage = self._llm_call_with_fallback(
                     client=self.cheap_client,
                     model=settings.CHEAP_LLM.model_name,
                     prompt=prompt,
@@ -197,14 +360,11 @@ class AnalysisAgent:
 
                     token_counter.add(settings.CHEAP_LLM.model_name, estimated_prompt_tokens, 0)
                 raise
-            if settings.TOKEN_TRACKING_ENABLED and usage:
-                from utils.token_counter import token_counter
-
-                token_counter.add(
-                    settings.CHEAP_LLM.model_name,
-                    usage.prompt_tokens,
-                    usage.completion_tokens,
-                )
+            self._record_token_usage(
+                settings.CHEAP_LLM.model_name,
+                estimated_prompt_tokens,
+                usage,
+            )
             return content
 
         return _do_call()
@@ -221,7 +381,7 @@ class AnalysisAgent:
         )
         def _do_call():
             try:
-                content, usage = self._chat_completion_with_fallback(
+                content, usage = self._llm_call_with_fallback(
                     client=self.cheap_client,
                     model=settings.CHEAP_LLM.model_name,
                     prompt=prompt,
@@ -234,14 +394,11 @@ class AnalysisAgent:
 
                     token_counter.add(settings.CHEAP_LLM.model_name, estimated_prompt_tokens, 0)
                 raise
-            if settings.TOKEN_TRACKING_ENABLED and usage:
-                from utils.token_counter import token_counter
-
-                token_counter.add(
-                    settings.CHEAP_LLM.model_name,
-                    usage.prompt_tokens,
-                    usage.completion_tokens,
-                )
+            self._record_token_usage(
+                settings.CHEAP_LLM.model_name,
+                estimated_prompt_tokens,
+                usage,
+            )
             return content.strip()
 
         return _do_call()
@@ -258,7 +415,7 @@ class AnalysisAgent:
         )
         def _do_call():
             try:
-                content, usage = self._chat_completion_with_fallback(
+                content, usage = self._llm_call_with_fallback(
                     client=self.smart_client,
                     model=settings.SMART_LLM.model_name,
                     prompt=prompt,
@@ -271,14 +428,11 @@ class AnalysisAgent:
 
                     token_counter.add(settings.SMART_LLM.model_name, estimated_prompt_tokens, 0)
                 raise
-            if settings.TOKEN_TRACKING_ENABLED and usage:
-                from utils.token_counter import token_counter
-
-                token_counter.add(
-                    settings.SMART_LLM.model_name,
-                    usage.prompt_tokens,
-                    usage.completion_tokens,
-                )
+            self._record_token_usage(
+                settings.SMART_LLM.model_name,
+                estimated_prompt_tokens,
+                usage,
+            )
             return content
 
         return _do_call()
