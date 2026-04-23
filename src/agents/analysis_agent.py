@@ -298,6 +298,7 @@ class AnalysisAgent:
                 if not content:
                     logger.warning(f"chat.completions 返回空内容，尝试降级参数（第{idx}次）")
                     continue
+                logger.info(f"LLM正文获取成功: via=chat.completions, len={len(content)}")
                 return content, getattr(resp, "usage", None)
             except Exception as e:
                 last_error = e
@@ -319,6 +320,7 @@ class AnalysisAgent:
                     if not content:
                         logger.warning(f"responses API 返回空内容，尝试降级参数（第{idx}次）")
                         continue
+                    logger.info(f"LLM正文获取成功: via=responses, len={len(content)}")
                     return content, getattr(resp, "usage", None)
                 except Exception as e:
                     last_error = e
